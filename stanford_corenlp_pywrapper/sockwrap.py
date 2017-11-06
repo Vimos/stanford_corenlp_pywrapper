@@ -4,8 +4,9 @@ Client and process monitor for the java socket server.
 
 from __future__ import division
 import subprocess, tempfile, time, os, logging, re, struct, socket, atexit, glob, itertools
-from copy import copy,deepcopy
+from copy import copy, deepcopy
 from pprint import pprint
+
 try:
     import ujson as json
 except ImportError:
@@ -17,18 +18,18 @@ except ImportError:
 
 MODES_items = [
 
-('ssplit',  {'annotators': "tokenize, ssplit",
-    'description': "tokenization and sentence splitting (included in all subsequent ones)", }),
-('pos',     {'annotators':"tokenize, ssplit, pos, lemma",
-    'description':"POS (and lemmas)",}),
-('ner',     {'annotators':"tokenize, ssplit, pos, lemma, ner, entitymentions",
-    'description':"POS and NER (and lemmas)",}),
-('parse',    {'annotators':"tokenize, ssplit, pos, lemma, parse",
-    'description':"fairly basic parsing with POS, lemmas, trees, dependencies",}),
-('nerparse', {'annotators':"tokenize, ssplit, pos, lemma, ner, entitymentions, parse",
-    'description':"parsing with NER, POS, lemmas, depenencies."}),
-('coref', {'annotators':"tokenize, ssplit, pos, lemma, ner, entitymentions, parse, dcoref",
-    'description':"Coreference, including constituent parsing."})
+    ('ssplit', {'annotators': "tokenize, ssplit",
+                'description': "tokenization and sentence splitting (included in all subsequent ones)", }),
+    ('pos', {'annotators': "tokenize, ssplit, pos, lemma",
+             'description': "POS (and lemmas)", }),
+    ('ner', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions",
+             'description': "POS and NER (and lemmas)", }),
+    ('parse', {'annotators': "tokenize, ssplit, pos, lemma, parse",
+               'description': "fairly basic parsing with POS, lemmas, trees, dependencies", }),
+    ('nerparse', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions, parse",
+                  'description': "parsing with NER, POS, lemmas, depenencies."}),
+    ('coref', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions, parse, dcoref",
+               'description': "Coreference, including constituent parsing."})
 ]
 
 MODES = dict(MODES_items)
@@ -41,10 +42,11 @@ LOG.setLevel("INFO")
 PARSEDOC_TIMEOUT_SEC = 60 * 5
 STARTUP_BUSY_WAIT_INTERVAL_SEC = 1.0
 
+
 def command(mode=None, configfile=None, configdict=None, comm_mode=None,
-        java_command="java",
-        java_options="-Xmx4g -XX:ParallelGCThreads=1",
-        **kwargs):
+            java_command="java",
+            java_options="-Xmx4g -XX:ParallelGCThreads=1",
+            **kwargs):
     d = {}
     d.update(**locals())
     d.update(**kwargs)
@@ -67,12 +69,12 @@ def command(mode=None, configfile=None, configdict=None, comm_mode=None,
         more_config += " --configdict '{}'".format(j)
     d['more_config'] = more_config
 
-    if comm_mode=='SOCKET':
+    if comm_mode == 'SOCKET':
         d['comm_info'] = "--server {server_port}".format(**d)
-    elif comm_mode=='PIPE':
+    elif comm_mode == 'PIPE':
         d['comm_info'] = "--outpipe {outpipe}".format(**d)
-    else: assert False, "need comm_mode to be SOCKET or PIPE but got " + repr(comm_mode)
-
+    else:
+        assert False, "need comm_mode to be SOCKET or PIPE but got " + repr(comm_mode)
 
     cmd = """exec {java_command} {java_options} -cp '{classpath}' 
     corenlp.SocketServer {comm_info} {more_config}"""
@@ -84,17 +86,16 @@ class SubprocessCrashed(Exception):
 
 
 class CoreNLP:
-
-    def __init__(self, mode=None, 
-            configfile=None, configdict=None,
-            corenlp_jars=(
-                "/home/sw/corenlp/stanford-corenlp-full-2015-04-20/*",
-                "/home/sw/stanford-srparser-2014-10-23-models.jar",
-                ),
-            comm_mode='PIPE',  # SOCKET or PIPE
-            server_port=12340, outpipe_filename_prefix="/tmp/corenlp_pywrap_pipe",
-            **more_configdict_args
-            ):
+    def __init__(self, mode=None,
+                 configfile=None, configdict=None,
+                 corenlp_jars=(
+                         "/home/sw/corenlp/stanford-corenlp-full-2015-04-20/*",
+                         "/home/sw/stanford-srparser-2014-10-23-models.jar",
+                 ),
+                 comm_mode='PIPE',  # SOCKET or PIPE
+                 server_port=12340, outpipe_filename_prefix="/tmp/corenlp_pywrap_pipe",
+                 **more_configdict_args
+                 ):
         """
         mode: if you supply this as a single string, we'll use a prebaked set
         of annotators.  if you don't want this, specify either (configfile or
@@ -128,15 +129,17 @@ class CoreNLP:
         self.configdict.update(more_configdict_args)
         if not self.configdict: self.configdict = None
 
-        if self.comm_mode=='PIPE':
+        if self.comm_mode == 'PIPE':
             tag = "pypid=%d_time=%s" % (os.getpid(), time.time())
             self.outpipe = "%s_%s" % (outpipe_filename_prefix, tag)
             assert not os.path.exists(self.outpipe)
 
-        assert isinstance(corenlp_jars, (list,tuple))
+        assert isinstance(corenlp_jars, (list, tuple))
 
         deglobbed = itertools.chain(*[glob.glob(f) for f in corenlp_jars])
-        assert any(os.path.exists(f) for f in deglobbed), "CoreNLP jar files don't seem to exist; are the paths correct?  Searched files: %s" % repr(deglobbed)
+        assert any(os.path.exists(f) for f in
+                   deglobbed), "CoreNLP jar files don't seem to exist; are the paths correct?  Searched files: %s" % repr(
+            deglobbed)
 
         local_libdir = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                                     'lib')
@@ -165,20 +168,20 @@ class CoreNLP:
     def start_server(self):
         self.kill_proc_if_running()
 
-        if self.comm_mode=='PIPE':
+        if self.comm_mode == 'PIPE':
             if not os.path.exists(self.outpipe):
                 os.mkfifo(self.outpipe)
-        
+
         cmd = command(**self.__dict__)
         LOG.info("Starting java subprocess, and waiting for signal it's ready, with command: %s" % cmd)
         self.proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
         time.sleep(STARTUP_BUSY_WAIT_INTERVAL_SEC)
 
-        if self.comm_mode=='SOCKET':
+        if self.comm_mode == 'SOCKET':
             sock = self.get_socket(num_retries=100, retry_interval=STARTUP_BUSY_WAIT_INTERVAL_SEC)
             sock.close()
-        elif self.comm_mode=='PIPE':
-            self.outpipe_fp = open(self.outpipe, 'r')
+        elif self.comm_mode == 'PIPE':
+            self.outpipe_fp = open(self.outpipe, 'rb')
 
         while True:
             # This loop is for if you have timeouts for the socket connection
@@ -191,7 +194,7 @@ class CoreNLP:
                 assert ret == "PONG", "Bad return data on startup ping: " + ret
                 LOG.info("Successful ping. The server has started.")
                 break
-            except socket.error, e:
+            except socket.error as e:
                 LOG.info("Waiting for startup: ping got exception: %s %s" % (type(e), e))
                 LOG.info("pausing before retry")
                 time.sleep(STARTUP_BUSY_WAIT_INTERVAL_SEC)
@@ -231,7 +234,7 @@ class CoreNLP:
                 return sock
             except (socket.error, socket.timeout) as e:
                 LOG.info("socket error when making connection (%s)" % e)
-                if trial < num_retries-1:
+                if trial < num_retries - 1:
                     LOG.info("pausing before retry")
                     time.sleep(retry_interval)
         assert False, "couldnt connect socket"
@@ -251,7 +254,7 @@ class CoreNLP:
                 LOG.warning("Bad JSON length %d, starts with: %s" % (len(data), repr(data[:1000])))
                 return None
             return decoded
-        except socket.timeout, e:
+        except socket.timeout as e:
             LOG.info("Socket timeout happened, returning None: %s %s" % (type(e), e))
             return None
             # This is tricky. maybe the process is running smoothly but just
@@ -266,7 +269,7 @@ class CoreNLP:
             sock.sendall(cmd + "\n")
             size_info_str = sock.recv(8)
         elif self.comm_mode == 'PIPE':
-            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.write(cmd.encode() + b"\n")
             self.proc.stdin.flush()
             size_info_str = self.outpipe_fp.read(8)
 
@@ -283,7 +286,7 @@ class CoreNLP:
                 data = sock.recv(remaining_size)
             elif self.comm_mode == 'PIPE':
                 data = self.outpipe_fp.read(remaining_size)
-            chunks.append(data)
+            chunks.append(data.decode())
             if curlen() >= size_info: break
             if len(chunks) > 1000:
                 LOG.warning("Incomplete value from server")
@@ -301,6 +304,7 @@ def test_modes():
     with pytest.raises(AssertionError):
         gosimple(comm_mode='asdfasdf')
 
+
 def test_coref():
     assert_no_java("no java when starting")
     p = CoreNLP("coref")
@@ -308,6 +312,7 @@ def test_coref():
     pprint(ret)
     assert 'entities' in ret
     assert isinstance(ret['entities'], list)
+
 
 def gosimple(**kwargs):
     assert_no_java("no java when starting")
@@ -321,16 +326,19 @@ def gosimple(**kwargs):
     p.kill_proc_if_running()
     assert_no_java()
 
+
 def test_paths():
     import pytest
     with pytest.raises(AssertionError):
         CoreNLP("ssplit", corenlp_jars=["/asdfadsf/asdfasdf"])
 
+
 def assert_no_java(msg=""):
     ps_output = os.popen("ps wux").readlines()
     javalines = [x for x in ps_output if re.search(r'\bbin/java\b', x)]
-    print ''.join(javalines)
+    print(''.join(javalines))
     assert len(javalines) == 0, msg
+
 
 # def test_doctimeout():
 #     assert_no_java("no java when starting")
@@ -341,12 +349,13 @@ def assert_no_java(msg=""):
 #     p.kill_proc_if_running()
 #     assert_no_java()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     import sys
-    if sys.argv[1]=='modes':
-        for mode,d in MODES_items:
-            print "  * `%s`: %s" % (mode, d['description'])
-    if sys.argv[1]=='modes_json':
+
+    if sys.argv[1] == 'modes':
+        for mode, d in MODES_items:
+            print("  * `%s`: %s" % (mode, d['description']))
+    if sys.argv[1] == 'modes_json':
         # import json as stdjson
         # print stdjson.dumps(MODES, indent=4)
-        print '"%s"' % json.dumps(MODES).replace('"', r'\"')
+        print('"%s"' % json.dumps(MODES).replace('"', r'\"'))

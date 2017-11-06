@@ -23,4 +23,4 @@ for filename in sys.argv[2:]:
 
     text = open(filename).read().decode('utf8', 'replace')
     jdoc = ss.parse_doc(text, raw=True)
-    print "%s\t%s" % (docid, jdoc)
+    print("%s\t%s" % (docid, jdoc))
