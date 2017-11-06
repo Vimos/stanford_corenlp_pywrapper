@@ -1,192 +1,103 @@
 """
-Client and process monitor for the java socket server.
+the socket server approach.
+this is eventually the right way to do it, but not tested well yet
 """
 
 from __future__ import division
-import subprocess, tempfile, time, os, logging, re, struct, socket, atexit, glob, itertools
-from copy import copy, deepcopy
-from pprint import pprint
+import subprocess, tempfile, time, os, logging, re, struct, socket, atexit
 
 try:
     import ujson as json
 except ImportError:
     import json
 
-# SUGGESTED: for constituent parsing models, specify shift-reduce parser in
-# configdict with:
-#  'parse.model': 'edu/stanford/nlp/models/srparser/englishSR.ser.gz'
-
-MODES_items = [
-
-    ('ssplit', {'annotators': "tokenize, ssplit",
-                'description': "tokenization and sentence splitting (included in all subsequent ones)", }),
-    ('pos', {'annotators': "tokenize, ssplit, pos, lemma",
-             'description': "POS (and lemmas)", }),
-    ('ner', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions",
-             'description': "POS and NER (and lemmas)", }),
-    ('parse', {'annotators': "tokenize, ssplit, pos, lemma, parse",
-               'description': "fairly basic parsing with POS, lemmas, trees, dependencies", }),
-    ('nerparse', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions, parse",
-                  'description': "parsing with NER, POS, lemmas, depenencies."}),
-    ('coref', {'annotators': "tokenize, ssplit, pos, lemma, ner, entitymentions, parse, dcoref",
-               'description': "Coreference, including constituent parsing."})
-]
-
-MODES = dict(MODES_items)
-
 logging.basicConfig()  # wtf, why we have to call this?
-LOG = logging.getLogger("CoreNLP_PyWrapper")
+LOG = logging.getLogger("StanfordSocketWrap")
 LOG.setLevel("INFO")
 # LOG.setLevel("DEBUG")
 
+COMMAND = """
+exec {JAVA} -Xmx{XMX_AMOUNT} -cp {classpath}
+    corenlp.PipeCommandRunner --server {server_port} {more_config}"""
+
+JAVA = "java"
+XMX_AMOUNT = "4g"
+
 PARSEDOC_TIMEOUT_SEC = 60 * 5
-STARTUP_BUSY_WAIT_INTERVAL_SEC = 1.0
+STARTUP_BUSY_WAIT_INTERVAL_SEC = 2.0
+
+# arg for mkstemp(dir=), so if None it defaults to somewhere
+TEMP_DIR = None
 
 
-def command(mode=None, configfile=None, configdict=None, comm_mode=None,
-            java_command="java",
-            java_options="-Xmx4g -XX:ParallelGCThreads=1",
-            **kwargs):
+def command(mode=None, configfile=None, **kwargs):
     d = {}
-    d.update(**locals())
+    d.update(globals())
     d.update(**kwargs)
 
     more_config = ""
-    if mode is None and configfile is None and configdict is None:
-        assert False, "Need to set mode, or the annotators directly, for this wrapper to work."
     if mode:
-        if configdict is not None:
-            assert 'annotators' not in configdict, "mode was given but annotators are set in the configdict.  use only one please."
-        elif configdict is None:
-            configdict = {}
-        LOG.info("mode given as '%s' so setting annotators: %s" % (mode, MODES[mode]['annotators']))
-        configdict['annotators'] = MODES[mode]['annotators']
+        more_config += " --mode {}".format(mode)
     if configfile:
         more_config += " --configfile {}".format(configfile)
-    if configdict:
-        j = json.dumps(configdict)
-        assert "'" not in j, "can't handle single quote in config values"
-        more_config += " --configdict '{}'".format(j)
     d['more_config'] = more_config
 
-    if comm_mode == 'SOCKET':
-        d['comm_info'] = "--server {server_port}".format(**d)
-    elif comm_mode == 'PIPE':
-        d['comm_info'] = "--outpipe {outpipe}".format(**d)
-    else:
-        assert False, "need comm_mode to be SOCKET or PIPE but got " + repr(comm_mode)
-
-    cmd = """exec {java_command} {java_options} -cp '{classpath}' 
-    corenlp.SocketServer {comm_info} {more_config}"""
-    return cmd.format(**d).replace("\n", " ")
+    return COMMAND.format(**d).replace("\n", " ")
 
 
 class SubprocessCrashed(Exception):
     pass
 
 
-class CoreNLP:
-    def __init__(self, mode=None,
-                 configfile=None, configdict=None,
-                 corenlp_jars=(
-                         "/home/sw/corenlp/stanford-corenlp-full-2015-04-20/*",
-                         "/home/sw/stanford-srparser-2014-10-23-models.jar",
-                 ),
-                 comm_mode='PIPE',  # SOCKET or PIPE
-                 server_port=12340, outpipe_filename_prefix="/tmp/corenlp_pywrap_pipe",
-                 **more_configdict_args
+class SockWrap:
+    def __init__(self, mode=None, server_port=12340, configfile=None,
+                 corenlp_libdir=os.environ['STANFORD_CORENLP_HOME'],
+                 corenlp_jars=("stanford-corenlp-3.8.0.jar", "stanford-corenlp-3.8.0-models.jar")
                  ):
-        """
-        mode: if you supply this as a single string, we'll use a prebaked set
-        of annotators.  if you don't want this, specify either (configfile or
-        configdict) and set 'annotators' there.
-
-        corenlp_jars: jars for the classpath.  tuple or list of strings.
-        this is just passed on to java's "-cp" flag; note that it accepts
-        limited use of wildcards.
-
-        configfile, configdict: can give a corenlp configuration, either as an
-        external file (like the .ini or java properties format, whatever it
-        is), or else as a python dictionary.  we just pass it on, though we
-        will look at the annotators setting.
-
-        Extra keyword arguments are added to the configdict.
-        Note you can't pass options with dots in them this way.
-
-        server_port: have to specify this if you want to run multple instances
-        in separate processes.  todo we should use some other communication
-        mechanism that doesnt have to worry about this
-        """
         self.mode = mode
         self.proc = None
         self.server_port = server_port
         self.configfile = configfile
-        self.comm_mode = comm_mode
-        self.outpipe = None
+        self.corenlp_libdir = corenlp_libdir
 
-        self.configdict = deepcopy(configdict)
-        if not self.configdict: self.configdict = {}
-        self.configdict.update(more_configdict_args)
-        if not self.configdict: self.configdict = None
-
-        if self.comm_mode == 'PIPE':
-            tag = "pypid=%d_time=%s" % (os.getpid(), time.time())
-            self.outpipe = "%s_%s" % (outpipe_filename_prefix, tag)
-            assert not os.path.exists(self.outpipe)
-
-        assert isinstance(corenlp_jars, (list, tuple))
-
-        deglobbed = itertools.chain(*[glob.glob(f) for f in corenlp_jars])
+        corenlp_jar_fullfilenames = [os.path.join(corenlp_libdir, f) for f in corenlp_jars]
         assert any(os.path.exists(f) for f in
-                   deglobbed), "CoreNLP jar files don't seem to exist; are the paths correct?  Searched files: %s" % repr(
-            deglobbed)
+                   corenlp_jar_fullfilenames), "CoreNLP jar file does not seem to exist; are the paths correct?  Searched files: %s" % repr(
+            corenlp_jar_fullfilenames)
 
         local_libdir = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                                     'lib')
 
-        jars = [os.path.join(local_libdir, "*")]
-        jars += corenlp_jars
+        jars = [os.path.join(local_libdir, "piperunner.jar"),
+                # for eclipse development only
+                # "/Users/brendano/myutil/bin",
+                os.path.join(local_libdir, "guava-13.0.1.jar"),
+                os.path.join(local_libdir, "jackson-all-1.9.11.jar"),
+                ]
+
+        jars += corenlp_jar_fullfilenames
         self.classpath = ':'.join(jars)
-        # self.classpath += ":../bin:bin"  ## for eclipse java dev
 
         # LOG.info("CLASSPATH: " + self.classpath)
 
         self.start_server()
         # This probably is only half-reliable, but worth a shot.
-        atexit.register(self.cleanup)
-
-    def cleanup(self):
-        self.kill_proc_if_running()
-        if self.outpipe and os.path.exists(self.outpipe):
-            os.unlink(self.outpipe)
+        atexit.register(self.kill_proc_if_running)
 
     def __del__(self):
         # This is also an unreliable way to ensure the subproc is gone, but
         # might as well try
-        self.cleanup()
+        self.kill_proc_if_running()
 
     def start_server(self):
         self.kill_proc_if_running()
-
-        if self.comm_mode == 'PIPE':
-            if not os.path.exists(self.outpipe):
-                os.mkfifo(self.outpipe)
-
-        cmd = command(**self.__dict__)
-        LOG.info("Starting java subprocess, and waiting for signal it's ready, with command: %s" % cmd)
-        self.proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
-        time.sleep(STARTUP_BUSY_WAIT_INTERVAL_SEC)
-
-        if self.comm_mode == 'SOCKET':
-            sock = self.get_socket(num_retries=100, retry_interval=STARTUP_BUSY_WAIT_INTERVAL_SEC)
-            sock.close()
-        elif self.comm_mode == 'PIPE':
-            self.outpipe_fp = open(self.outpipe, 'rb')
-
+        cmd = command(mode=self.mode, server_port=self.server_port,
+                      configfile=self.configfile,
+                      classpath=self.classpath)
+        LOG.info("Starting pipe subprocess, and waiting for signal it's ready, with command: %s" % cmd)
+        self.proc = subprocess.Popen(cmd, shell=True)
         while True:
-            # This loop is for if you have timeouts for the socket connection
-            # The pipe system doesn't have timeouts, so this should run only
-            # once in that case.
+            time.sleep(STARTUP_BUSY_WAIT_INTERVAL_SEC)
             try:
                 ret = self.send_command_and_parse_result('PING\t""', 2)
                 if ret is None:
@@ -196,8 +107,6 @@ class CoreNLP:
                 break
             except socket.error as e:
                 LOG.info("Waiting for startup: ping got exception: %s %s" % (type(e), e))
-                LOG.info("pausing before retry")
-                time.sleep(STARTUP_BUSY_WAIT_INTERVAL_SEC)
 
         LOG.info("Subprocess is ready.")
 
@@ -220,38 +129,31 @@ class CoreNLP:
             LOG.warning("Killing subprocess %s" % self.proc.pid)
             os.kill(self.proc.pid, 9)
 
-    def parse_doc(self, text, timeout=PARSEDOC_TIMEOUT_SEC, raw=False):
+    def parse_doc(self, text, timeout=PARSEDOC_TIMEOUT_SEC):
         cmd = "PARSEDOC\t%s" % json.dumps(text)
-        return self.send_command_and_parse_result(cmd, timeout, raw=raw)
+        return self.send_command_and_parse_result(cmd, timeout)
 
-    def get_socket(self, num_retries=1, retry_interval=1):
+    def get_socket(self):
         # could be smarter here about reusing the same socket?
-        for trial in range(num_retries):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        while True:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # not sure if this is needed?
                 sock.connect(('localhost', self.server_port))
-                return sock
-            except (socket.error, socket.timeout) as e:
-                LOG.info("socket error when making connection (%s)" % e)
-                if trial < num_retries - 1:
-                    LOG.info("pausing before retry")
-                    time.sleep(retry_interval)
-        assert False, "couldnt connect socket"
+                break
+            except OSError as e:
+                time.sleep(0.250)
+        return sock
 
-    def send_command_and_parse_result(self, cmd, timeout, raw=False):
+    def send_command_and_parse_result(self, cmd, timeout):
         try:
             self.ensure_proc_is_running()
             data = self.send_command_and_get_string_result(cmd, timeout)
-            if data is None: return None
             decoded = None
-            if raw:
-                return data
             try:
                 decoded = json.loads(data)
             except ValueError:
                 LOG.warning("Bad JSON returned from subprocess; returning null.")
-                LOG.warning("Bad JSON length %d, starts with: %s" % (len(data), repr(data[:1000])))
                 return None
             return decoded
         except socket.timeout as e:
@@ -263,63 +165,24 @@ class CoreNLP:
             # the process now just in case?
 
     def send_command_and_get_string_result(self, cmd, timeout):
-        if self.comm_mode == 'SOCKET':
-            sock = self.get_socket(num_retries=100)
-            sock.settimeout(timeout)
-            sock.sendall(cmd + "\n")
-            size_info_str = sock.recv(8)
-        elif self.comm_mode == 'PIPE':
-            self.proc.stdin.write(cmd.encode() + b"\n")
-            self.proc.stdin.flush()
-            size_info_str = self.outpipe_fp.read(8)
-
+        sock = self.get_socket()
+        sock.settimeout(timeout)
+        sock.sendall(cmd.encode() + b"\n")
+        size_info_str = sock.recv(8)
         # java "long" is 8 bytes, which python struct calls "long long".
         # java default byte ordering is big-endian.
         size_info = struct.unpack('>Q', size_info_str)[0]
-        # print "size expected", size_info
-
-        chunks = []
-        curlen = lambda: sum(len(x) for x in chunks)
-        while True:
-            remaining_size = size_info - curlen()
-            if self.comm_mode == 'SOCKET':
-                data = sock.recv(remaining_size)
-            elif self.comm_mode == 'PIPE':
-                data = self.outpipe_fp.read(remaining_size)
-            chunks.append(data.decode())
-            if curlen() >= size_info: break
-            if len(chunks) > 1000:
-                LOG.warning("Incomplete value from server")
-                return None
-            time.sleep(0.01)
-        return ''.join(chunks)
+        data = sock.recv(size_info)
+        sock.close()
+        return data
 
 
-def test_modes():
-    import pytest
-    gosimple(comm_mode='SOCKET')
-    gosimple(comm_mode='PIPE')
-    with pytest.raises(AssertionError):
-        gosimple(comm_mode=None)
-    with pytest.raises(AssertionError):
-        gosimple(comm_mode='asdfasdf')
-
-
-def test_coref():
-    assert_no_java("no java when starting")
-    p = CoreNLP("coref")
-    ret = p.parse_doc("I saw Fred. He saw me.")
-    pprint(ret)
-    assert 'entities' in ret
-    assert isinstance(ret['entities'], list)
-
-
-def gosimple(**kwargs):
+def test_simple():
     assert_no_java("no java when starting")
 
-    p = CoreNLP("ssplit", **kwargs)
+    p = SockWrap("ssplit")
     ret = p.parse_doc("Hello world.")
-    # pprint(ret)
+    print(ret)
     assert len(ret['sentences']) == 1
     assert u' '.join(ret['sentences'][0]['tokens']) == u"Hello world ."
 
@@ -330,7 +193,7 @@ def gosimple(**kwargs):
 def test_paths():
     import pytest
     with pytest.raises(AssertionError):
-        CoreNLP("ssplit", corenlp_jars=["/asdfadsf/asdfasdf"])
+        SockWrap("ssplit", corenlp_libdir="blabla_bad_dir")
 
 
 def assert_no_java(msg=""):
@@ -339,23 +202,21 @@ def assert_no_java(msg=""):
     print(''.join(javalines))
     assert len(javalines) == 0, msg
 
-
 # def test_doctimeout():
 #     assert_no_java("no java when starting")
 #
-#     p = CoreNLP("pos")
+#     p = SockWrap("pos")
 #     ret = p.parse_doc(open("allbrown.txt").read(), 0.5)
 #     assert ret is None
 #     p.kill_proc_if_running()
 #     assert_no_java()
-
-if __name__ == '__main__':
-    import sys
-
-    if sys.argv[1] == 'modes':
-        for mode, d in MODES_items:
-            print("  * `%s`: %s" % (mode, d['description']))
-    if sys.argv[1] == 'modes_json':
-        # import json as stdjson
-        # print stdjson.dumps(MODES, indent=4)
-        print('"%s"' % json.dumps(MODES).replace('"', r'\"'))
+#
+# def test_crash():
+#     assert_no_java("no java when starting")
+#     p = SockWrap("ssplit")
+#     p.crash()
+#     ret = p.parse_doc("Hello world.")
+#     assert len(ret['sentences'])==1
+#
+#     p.kill_proc_if_running()
+#     assert_no_java()
